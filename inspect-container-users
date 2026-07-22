@@ -139,9 +139,9 @@ if [[ ! -d "$QUADLET_DIR" ]]; then
     exit 1
 fi
 
-shopt -s nullglob
-unit_files=("$QUADLET_DIR"/*.container)
-shopt -u nullglob
+shopt -s nullglob globstar
+unit_files=("$QUADLET_DIR"/**/*.container)
+shopt -u nullglob globstar
 
 if [[ ${#unit_files[@]} -eq 0 ]]; then
     echo "No .container files found in $QUADLET_DIR" >&2
