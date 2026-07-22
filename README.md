@@ -21,7 +21,7 @@ It also probes the image for known privilege-drop conventions (PUID/PGID for lin
 
 ```bash
 # Download to a directory in your PATH
-wget -O ~/.local/bin/inspect-container-users   https://raw.githubusercontent.com//YOURREPO/main/inspect-container-users
+wget -O ~/.local/bin/inspect-container-users https://raw.githubusercontent.com/upmcplanetracker/inspect-rootless-podman-container-users/main/inspect-container-users
 
 # Make it executable
 chmod +x ~/.local/bin/inspect-container-users
@@ -156,7 +156,3 @@ Done.
 - [Podman](https://podman.io/) installed and configured
 - Bash 4.0+
 - Images must be pulled locally (the script does not auto-pull)
-
-## License
-
-MIT
