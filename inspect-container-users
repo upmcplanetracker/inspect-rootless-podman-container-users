@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+#
+# inspect-container-users.sh
+#
+# Walks every Podman Quadlet (.container) unit file in a given directory
+# (default: ~/.config/containers/systemd), extracts the Image= value from
+# each, and reports:
+#   1. /etc/passwd from inside the image (for reference -- what accounts
+#      exist)
+#   2. Config.User from the image itself (launch-time default only -- does
+#      NOT reflect an internal privilege drop via setpriv/gosu/su-exec)
+#   3. The ACTUAL user(s) the container's live process(es) are running as
+#      right now, via `podman top <container> user` against the RUNNING
+#      container (not the image) -- this is the only one of the three
+#      that tells you the truth for images that drop privileges internally
+#      after starting as root (see MinusPod's entrypoint.sh for an example).
+#
+# A container name is derived from ContainerName= in the unit file if
+# present, otherwise the unit's basename (Quadlet's default naming). Only
+# unit files whose container is currently running get a "live user" check;
+# stopped containers are noted as such.
+#
+# At the end, containers are categorized and summarized:
+#   - Running ONLY as root
+#   - Running as root + other users
+#   - Running as non-root
+#   - Stopped / Unknown
+#
+# Usage:
+#   ./inspect-container-users.sh [options] [quadlet_dir]
+#
+# Options:
+#   -q, --quiet         Suppress per-container detail output (summary only)
+#   -l, --log-to-file   Write per-container detail to a timestamped log file
+#                       (default: ~/.local/share/inspect-container-users/)
+#   -h, --help          Show this help message
+#
+# Examples:
+#   ./inspect-container-users.sh ~/.config/containers/systemd
+#   ./inspect-container-users.sh --quiet ~/.config/containers/systemd
+#   ./inspect-container-users.sh --log-to-file
+#   ./inspect-container-users.sh -q -l
+
+set -uo pipefail  # no -e: individual container failures shouldn't kill the run
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+QUIET=false
+LOG_TO_FILE=false
+LOG_DIR="${LOG_DIR:-$HOME/.local/share/inspect-container-users}"
+HELP=false
+POS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -l|--log-to-file)
+            LOG_TO_FILE=true
+            shift
+            ;;
+        -h|--help)
+            HELP=true
+            shift
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            echo "Usage: $0 [-q|--quiet] [-l|--log-to-file] [quadlet_dir]" >&2
+            exit 1
+            ;;
+        *)
+            POS_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ "$HELP" == true ]]; then
+    sed -n '/^# Usage:/,/^# /p' "$0" | sed 's/^# //' | sed 's/^#$/\n/'
+    exit 0
+fi
+
+QUADLET_DIR="${POS_ARGS[0]:-$HOME/.config/containers/systemd}"
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+LOGFILE=""
+if [[ "$LOG_TO_FILE" == true ]]; then
+    mkdir -p "$LOG_DIR"
+    LOGFILE="$LOG_DIR/inspect-$(date +%Y%m%d_%H%M%S).log"
+    touch "$LOGFILE"
+fi
+
+# Helper: detail() writes to logfile (and stdout if not quiet)
+#         status() always writes to stdout
+detail() {
+    if [[ -n "$LOGFILE" ]]; then
+        printf '%s\n' "$@" >> "$LOGFILE"
+    fi
+    if [[ "$QUIET" == false ]]; then
+        printf '%s\n' "$@"
+    fi
+}
+
+status() {
+    printf '%s\n' "$@"
+}
+
+# Progress bar helper: prints [====>    ] style bar, overwrites same line
+# Usage: progress_bar current total [label]
+progress_bar() {
+    local current="$1"
+    local total="$2"
+    local label="${3:-}"
+    local width=30
+    local pct=$(( current * 100 / total ))
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+    local bar
+    bar="$(printf '%*s' "$filled" '' | tr ' ' '=')$(printf '%*s' "$empty" '' | tr ' ' ' ')"
+    # \r returns to start of line, \e[K clears to end
+    printf '\r  [%s] %3d%% (%d/%d) %s\e[K' "$bar" "$pct" "$current" "$total" "$label" >&2
+}
+
+# Clear progress bar line
+clear_progress() {
+    printf '\r\e[K' >&2
+}
+
+# ---------------------------------------------------------------------------
+# Validate quadlet directory
+# ---------------------------------------------------------------------------
+if [[ ! -d "$QUADLET_DIR" ]]; then
+    echo "Error: directory not found: $QUADLET_DIR" >&2
+    exit 1
+fi
+
+shopt -s nullglob
+unit_files=("$QUADLET_DIR"/*.container)
+shopt -u nullglob
+
+if [[ ${#unit_files[@]} -eq 0 ]]; then
+    echo "No .container files found in $QUADLET_DIR" >&2
+    exit 1
+fi
+
+status "Found ${#unit_files[@]} unit file(s) in $QUADLET_DIR"
+[[ -n "$LOGFILE" ]] && status "Logging detail to: $LOGFILE"
+status ""
+
+root_only_containers=()
+root_mixed_containers=()
+nonroot_containers=()
+stopped_containers=()
+unknown_containers=()
+
+total=${#unit_files[@]}
+
+for i in "${!unit_files[@]}"; do
+    unit="${unit_files[$i]}"
+    idx=$((i + 1))
+    unit_base="$(basename "$unit" .container)"
+
+    # Show progress bar in quiet mode
+    if [[ "$QUIET" == true ]]; then
+        progress_bar "$idx" "$total" "$unit_base"
+    fi
+
+    # FIX: stricter parsing - ignore comment lines, handle inline comments
+    image=$(grep -E '^\s*Image\s*=' "$unit" | grep -v '^\s*#' | head -n1 | sed -E 's/^\s*Image\s*=\s*//' | sed -E 's/\s+#.*$//' | tr -d '\r')
+    cname=$(grep -E '^\s*ContainerName\s*=' "$unit" | grep -v '^\s*#' | head -n1 | sed -E 's/^\s*ContainerName\s*=\s*//' | sed -E 's/\s+#.*$//' | tr -d '\r')
+    # Also check for User= override in the quadlet file
+    quadlet_user=$(grep -E '^\s*User\s*=' "$unit" | grep -v '^\s*#' | head -n1 | sed -E 's/^\s*User\s*=\s*//' | sed -E 's/\s+#.*$//' | tr -d '\r')
+
+    [[ -z "$cname" ]] && cname="$unit_base"
+
+    if [[ -z "$image" ]]; then
+        status "Warning: no Image= found in $(basename "$unit"), skipping"
+        continue
+    fi
+
+    detail "==================================================================="
+    detail "Unit:          $(basename "$unit")"
+    detail "Container:     $cname"
+    detail "Image:         $image"
+    [[ -n "$quadlet_user" ]] && detail "Quadlet User=:  $quadlet_user"
+    detail "-------------------------------------------------------------------"
+
+    # --- /etc/passwd from image ---
+    detail "--- /etc/passwd (from image) ---"
+    passwd_out=$(podman run --rm --entrypoint cat "$image" /etc/passwd 2>&1)
+    passwd_rc=$?
+    if [[ $passwd_rc -ne 0 ]]; then
+        detail "(failed to cat /etc/passwd — image may lack /etc/passwd, cat, or entrypoint override)"
+        detail "Error: $passwd_out"
+    else
+        detail "$passwd_out"
+    fi
+    detail ""
+
+    # --- Config.User from image ---
+    detail "--- Config.User (image launch-time default; does NOT reflect an"
+    detail "    internal setpriv/gosu/su-exec drop -- see live user check below) ---"
+    config_user=$(podman inspect --format '{{.Config.User}}' "$image" 2>&1)
+    inspect_rc=$?
+    if [[ $inspect_rc -ne 0 ]]; then
+        detail "(failed to inspect image — is it pulled locally? try: podman pull $image)"
+        detail "Error: $config_user"
+    else
+        detail "$config_user"
+    fi
+    detail ""
+
+    # --- Live user check ---
+    detail "--- Live user (actual running process, via 'podman top') ---"
+    if ! podman container exists "$cname" 2>/dev/null; then
+        detail "Container '$cname' is not currently running/present. Skipping live check."
+        stopped_containers+=("$cname (image: $image)")
+        detail ""
+        continue
+    fi
+
+    top_output=$(podman top "$cname" user 2>&1)
+    top_rc=$?
+
+    if [[ $top_rc -ne 0 ]]; then
+        detail "Failed to query live process user: $top_output"
+        unknown_containers+=("$cname (podman top failed)")
+        detail ""
+        continue
+    fi
+
+    detail "$top_output"
+
+    # Drop the "USER" header line, get unique set of users actually running
+    live_users=$(echo "$top_output" | tail -n +2 | sort -u | tr '\n' ',' | sed 's/,$//')
+
+    if [[ -z "$live_users" ]]; then
+        detail "(no processes reported)"
+        unknown_containers+=("$cname (no processes reported)")
+    elif echo "$live_users" | grep -qE '(^|,)(root|0)(,|$)'; then
+
+        # Privilege-drop mechanism probe (only if root is detected)
+        detail ""
+        detail "  -- Privilege-drop mechanism probe --"
+        probe_out=$(podman run --rm --entrypoint sh "$image" -c \
+            'env; cat /etc/s6-overlay/s6-rc.d/*/run 2>/dev/null; cat /entrypoint.sh 2>/dev/null; cat /init 2>/dev/null' \
+            2>/dev/null | head -100)
+
+        if [[ -z "$probe_out" ]]; then
+            detail "  (probe returned nothing -- image may lack sh, or none of these paths exist)"
+            mechanism="unknown"
+        elif echo "$probe_out" | grep -qiE 'PUID|PGID'; then
+            detail "  Found PUID/PGID reference(s) -- likely an s6-overlay/linuxserver.io-style"
+            detail "  image. Use Environment=PUID=... / Environment=PGID=... in the Quadlet,"
+            detail "  NOT User= (a direct User= override can skip the init logic that expects"
+            detail "  to start as root and configure/drop privileges itself)."
+            detail "  Matching line(s):"
+            echo "$probe_out" | grep -iE 'PUID|PGID' | sed 's/^/    /' | head -5 | while IFS= read -r line; do detail "$line"; done
+            mechanism="PUID/PGID"
+        elif echo "$probe_out" | grep -qiE 'setpriv|gosu|su-exec|su -c|exec su '; then
+            detail "  Found a setpriv/gosu/su-exec style privilege drop (like MinusPod's"
+            detail "  entrypoint). Root is likely transient -- check whether the script"
+            detail "  supports a User=/APP_UID override, or leave root running as-is"
+            detail "  since it may self-drop already (this may be a detection-timing false"
+            detail "  positive -- re-run 'podman top $cname user' a few times to confirm)."
+            mechanism="setpriv/gosu"
+        else
+            detail "  No known PUID/PGID or setpriv/gosu convention detected. This MAY be a"
+            detail "  plain entrypoint with no privilege-drop logic at all -- a direct"
+            detail "  User=1000:1000 override plus check-nonroot-viability.sh is the more"
+            detail "  likely path, but verify manually before assuming."
+            mechanism="unclear/manual review"
+        fi
+        detail ""
+
+        # Check if there are non-root users alongside root
+        other_users=$(echo "$live_users" | tr ',' '\n' | grep -vE '^(root|0)$' | tr '\n' ',' | sed 's/,$//')
+
+        if [[ -z "$other_users" ]]; then
+            detail "Verdict: RUNNING ONLY AS ROOT ($live_users)"
+            root_only_containers+=("$cname (image: $image, live user(s): $live_users, mechanism: $mechanism)")
+        else
+            detail "Verdict: RUNNING AS ROOT + OTHER USERS ($live_users)"
+            root_mixed_containers+=("$cname (image: $image, live user(s): $live_users, mechanism: $mechanism)")
+        fi
+    else
+        detail "Verdict: running as non-root ($live_users)"
+        nonroot_containers+=("$cname (live user(s): $live_users)")
+    fi
+    detail ""
+done
+
+# Clear progress bar before printing summary
+if [[ "$QUIET" == true ]]; then
+    clear_progress
+fi
+
+# ---------------------------------------------------------------------------
+# SUMMARY (always printed to stdout)
+# ---------------------------------------------------------------------------
+status "==================================================================="
+status "SUMMARY"
+status "==================================================================="
+status ""
+status "Running ONLY as root (${#root_only_containers[@]}):"
+if [[ ${#root_only_containers[@]} -eq 0 ]]; then
+    status "  (none)"
+else
+    for c in "${root_only_containers[@]}"; do status "  - $c"; done
+fi
+status ""
+status "Running as root + other users (${#root_mixed_containers[@]}):"
+if [[ ${#root_mixed_containers[@]} -eq 0 ]]; then
+    status "  (none)"
+else
+    for c in "${root_mixed_containers[@]}"; do status "  - $c"; done
+fi
+status ""
+status "Running as non-root (${#nonroot_containers[@]}):"
+if [[ ${#nonroot_containers[@]} -eq 0 ]]; then
+    status "  (none)"
+else
+    for c in "${nonroot_containers[@]}"; do status "  - $c"; done
+fi
+status ""
+status "Not running / stopped (${#stopped_containers[@]}):"
+if [[ ${#stopped_containers[@]} -eq 0 ]]; then
+    status "  (none)"
+else
+    for c in "${stopped_containers[@]}"; do status "  - $c"; done
+fi
+status ""
+status "Unknown / check failed (${#unknown_containers[@]}):"
+if [[ ${#unknown_containers[@]} -eq 0 ]]; then
+    status "  (none)"
+else
+    for c in "${unknown_containers[@]}"; do status "  - $c"; done
+fi
+status ""
+[[ -n "$LOGFILE" ]] && status "Detail log: $LOGFILE"
+status "Done."
